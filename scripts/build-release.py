@@ -18,7 +18,7 @@ def build(output):
         raise ValueError("VERSION must contain a stable semantic version")
     output.mkdir(parents=True, exist_ok=True)
     archive = output / f"codex-switcher-{version}.tar.gz"
-    with archive.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as zipped:
+    with archive.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0, compresslevel=9) as zipped:
         with tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as tar:
             for name in FILES:
                 data = (ROOT / name).read_bytes()

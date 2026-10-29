@@ -25,8 +25,8 @@ class CodexSwitcher < Formula
 
   test do
     assert_match "codex-switcher #{version}", shell_output("#{bin}/codex-cli --switcher-version")
-    assert_predicate libexec/"codex-session-paths.sh", :exist?
-    assert_predicate libexec/"install.sh", :exist?
+    assert_path_exists libexec/"codex-session-paths.sh"
+    assert_path_exists libexec/"install.sh"
     refute_path_exists testpath/".codex-personal"
     refute_path_exists testpath/".codex-work"
   end
