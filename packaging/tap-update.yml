@@ -1,0 +1,40 @@
+name: Update formula
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag=$(gh release view --repo forkunsafe/codex-switcher --json tagName --jq .tagName)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf '%s\n' "$tag" > release-tag.txt
+          gh release download "$tag" --repo forkunsafe/codex-switcher --dir release \
+            --pattern SHA256SUMS --pattern codex-switcher.rb \
+            --pattern "codex-switcher-${tag#v}.tar.gz"
+      - name: Verify release and update formula
+        run: python3 scripts/update-formula.py release "$(cat release-tag.txt)"
+      - name: Commit formula update
+        run: |
+          if git diff --quiet -- Formula/codex-switcher.rb; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/codex-switcher.rb
+          git commit -m "Update codex-switcher to $(cat release-tag.txt)"
+          git push

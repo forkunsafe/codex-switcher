@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MARKER_NAME=".codex-account"
+EXCLUDE_ENTRY="/.codex-account"
+IS_GIT_REPOSITORY=0
+PERSONAL_HOME="$HOME/.codex-personal"
+WORK_HOME="$HOME/.codex-work"
+LEGACY_HOME="$HOME/.codex"
+DESKTOP_APP_ID="com.openai.codex"
+
+print_error() {
+    printf 'Error: %s\n' "$*" >&2
+}
+
+detect_project() {
+    local detected_root
+
+    if detected_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+        PROJECT_ROOT=$detected_root
+        IS_GIT_REPOSITORY=1
+    else
+        PROJECT_ROOT=$PWD
+        IS_GIT_REPOSITORY=0
+    fi
+
+    MARKER_PATH="$PROJECT_ROOT/$MARKER_NAME"
+}
+
+ensure_local_git_exclude() {
+    local exclude_path exclude_parent line_count
+
+    if [ "$IS_GIT_REPOSITORY" -ne 1 ]; then
+        return 0
+    fi
+
+    exclude_path=$(git -C "$PROJECT_ROOT" rev-parse --git-path info/exclude)
+    case "$exclude_path" in
+        /*) ;;
+        *) exclude_path="$PROJECT_ROOT/$exclude_path" ;;
+    esac
+
+    exclude_parent=$(dirname "$exclude_path")
+    mkdir -p "$exclude_parent"
+    touch "$exclude_path"
+
+    if grep -F -x -q "$EXCLUDE_ENTRY" "$exclude_path"; then
+        return 0
+    fi
+
+    if [ -s "$exclude_path" ]; then
+        line_count=$(tail -c 1 "$exclude_path" | wc -l | tr -d '[:space:]')
+        if [ "$line_count" = "0" ]; then
+            printf '\n' >> "$exclude_path"
+        fi
+    fi
+    printf '%s\n' "$EXCLUDE_ENTRY" >> "$exclude_path"
+}
+
+read_configured_account() {
+    local marker_value
+
+    if [ ! -f "$MARKER_PATH" ]; then
+        return 1
+    fi
+
+    marker_value=$(cat "$MARKER_PATH")
+    case "$marker_value" in
+        personal|work)
+            ACCOUNT=$marker_value
+            return 0
+            ;;
+        *)
+            print_error "Invalid account marker: $MARKER_PATH"
+            printf 'Expected exactly "personal" or "work". Run codex-cli --switch to replace it.\n' >&2
+            return 2
+            ;;
+    esac
+}
+
+prompt_for_account() {
+    local choice normalized
+
+    while :; do
+        printf '1) Personal\n'
+        printf '2) Work\n\n'
+        printf 'Choose Codex account [1/2]: '
+
+        if ! IFS= read -r choice; then
+            printf '\n' >&2
+            print_error "No account was selected."
+            return 1
+        fi
+
+        normalized=$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')
+        case "$normalized" in
+            1|personal|p)
+                ACCOUNT=personal
+                return 0
+                ;;
+            2|work|w)
+                ACCOUNT=work
+                return 0
+                ;;
+            *)
+                printf 'Please enter 1, 2, personal, work, p, or w.\n\n' >&2
+                ;;
+        esac
+    done
+}
+
+read_global_account() {
+    local link_target
+
+    if [ ! -L "$LEGACY_HOME" ]; then
+        return 1
+    fi
+
+    link_target=$(readlink "$LEGACY_HOME")
+    case "$link_target" in
+        "$PERSONAL_HOME") GLOBAL_ACCOUNT=personal ;;
+        "$WORK_HOME") GLOBAL_ACCOUNT=work ;;
+        *) return 2 ;;
+    esac
+    return 0
+}
+
+switch_global_account() {
+    local read_status=0 target_home
+
+    read_global_account || read_status=$?
+    case "$read_status" in
+        0) printf 'Current global Codex account: %s\n\n' "$(describe_account "$GLOBAL_ACCOUNT" "$LEGACY_HOME")" ;;
+        1)
+            if [ -e "$LEGACY_HOME" ]; then
+                print_error "$LEGACY_HOME is not a symbolic link. No data was changed."
+                printf 'Run the installer to migrate this directory safely before using --global-switch.\n' >&2
+                return 1
+            fi
+            printf 'No global Codex account is currently configured.\n\n'
+            ;;
+        2)
+            print_error "$LEGACY_HOME points to an unknown target: $(readlink "$LEGACY_HOME")"
+            printf 'Resolve this symbolic link manually before using --global-switch.\n' >&2
+            return 1
+            ;;
+    esac
+
+    prompt_for_account
+    case "$ACCOUNT" in
+        personal) target_home=$PERSONAL_HOME ;;
+        work) target_home=$WORK_HOME ;;
+    esac
+    mkdir -p "$target_home"
+    stop_global_codex
+
+    if [ -L "$LEGACY_HOME" ]; then
+        ln -sfn "$target_home" "$LEGACY_HOME"
+    else
+        ln -s "$target_home" "$LEGACY_HOME"
+    fi
+    printf 'Global Codex account: %s\n' "$(describe_account "$ACCOUNT" "$target_home")"
+    printf '%s -> %s\n' "$LEGACY_HOME" "$target_home"
+}
+
+desktop_app_running() {
+    [ "$(osascript -e "application id \"$DESKTOP_APP_ID\" is running" 2>/dev/null)" = "true" ]
+}
+
+daemon_running() {
+    pgrep -f 'codex app-server' >/dev/null 2>&1
+}
+
+# The Codex app and plain codex share one app-server daemon that keeps the
+# account it started with, so it must be stopped before ~/.codex changes.
+stop_global_codex() {
+    local answer waited=0
+
+    if ! desktop_app_running && ! daemon_running; then
+        return 0
+    fi
+
+    printf 'Still using the current global account:\n'
+    if desktop_app_running; then
+        printf '  - Codex desktop app\n'
+    fi
+    if daemon_running; then
+        printf '  - shared app-server daemon (also used by plain codex sessions)\n'
+    fi
+    printf 'codex-cli sessions are not affected.\n\n'
+    printf 'Quit them now? Unsaved work in the app and plain codex sessions will stop [y/N]: '
+
+    if ! IFS= read -r answer; then
+        answer=
+    fi
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *)
+            printf 'Left running. Restart them after the switch, or they will mix accounts.\n\n' >&2
+            return 0
+            ;;
+    esac
+
+    if desktop_app_running; then
+        osascript -e "tell application id \"$DESKTOP_APP_ID\" to quit" >/dev/null 2>&1 || true
+        while desktop_app_running && [ "$waited" -lt 15 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if desktop_app_running; then
+            print_error "The Codex app did not quit within 15 seconds. No data was changed."
+            return 1
+        fi
+        printf 'Codex app quit.\n'
+    fi
+
+    if daemon_running; then
+        codex app-server daemon stop >/dev/null 2>&1 || true
+        sleep 1
+        if daemon_running; then
+            pkill -f 'codex app-server' 2>/dev/null || true
+            sleep 1
+        fi
+        if daemon_running; then
+            print_error "The app-server daemon is still running. No data was changed."
+            pgrep -fl 'codex app-server' >&2 || true
+            return 1
+        fi
+        printf 'App-server daemon stopped.\n'
+    fi
+    printf '\n'
+}
+
+save_account() {
+    local marker_tmp
+
+    marker_tmp="$MARKER_PATH.tmp.$$"
+    trap 'rm -f "$marker_tmp"' EXIT HUP INT TERM
+    printf '%s\n' "$ACCOUNT" > "$marker_tmp"
+    mv -f "$marker_tmp" "$MARKER_PATH"
+    trap - EXIT HUP INT TERM
+}
+
+configure_new_project() {
+    printf 'No Codex account configured for:\n'
+    printf '  %s\n\n' "$PROJECT_ROOT"
+    prompt_for_account
+    save_account
+    printf 'Saved: %s\n' "$ACCOUNT"
+}
+
+switch_account() {
+    local read_status=0
+
+    read_configured_account || read_status=$?
+    if [ "$read_status" -eq 0 ]; then
+        printf 'Current Codex account: %s\n\n' "$ACCOUNT"
+    else
+        if [ "$read_status" -eq 2 ]; then
+            printf 'The invalid marker will be replaced.\n\n' >&2
+        else
+            printf 'No Codex account is currently configured for:\n'
+            printf '  %s\n\n' "$PROJECT_ROOT"
+        fi
+    fi
+
+    prompt_for_account
+    save_account
+    ensure_local_git_exclude
+    printf 'Saved: %s\n' "$ACCOUNT"
+}
+
+set_codex_home() {
+    case "$ACCOUNT" in
+        personal) CODEX_HOME=$PERSONAL_HOME ;;
+        work) CODEX_HOME=$WORK_HOME ;;
+        *)
+            print_error "Unsupported account: $ACCOUNT"
+            return 1
+            ;;
+    esac
+}
+
+account_email() {
+    local token payload
+
+    token=$(plutil -extract tokens.id_token raw -o - "$1/auth.json" 2>/dev/null) || return 1
+    payload=$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')
+    while [ $(( ${#payload} % 4 )) -ne 0 ]; do
+        payload="$payload="
+    done
+    printf '%s' "$payload" | base64 -D 2>/dev/null | plutil -extract email raw -o - - 2>/dev/null
+}
+
+describe_account() {
+    local email
+
+    if email=$(account_email "$2"); then
+        printf '%s (%s)' "$1" "$email"
+    else
+        printf '%s (not logged in)' "$1"
+    fi
+}
+
+ensure_login() {
+    if [ -f "$CODEX_HOME/auth.json" ]; then
+        return 0
+    fi
+
+    printf 'No Codex login was found for the %s account.\n' "$ACCOUNT"
+    printf 'Starting Codex login with CODEX_HOME=%s\n\n' "$CODEX_HOME"
+    env CODEX_HOME="$CODEX_HOME" codex login
+}
+
+show_startup_hint() {
+    local other_account answer
+
+    # Bare interactive launches need time to read this before the TUI clears
+    # the screen. Explicit commands and redirected input must not pause.
+    if [ "$#" -ne 0 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+        return 0
+    fi
+    case "$ACCOUNT" in
+        personal) other_account=work ;;
+        work) other_account=personal ;;
+    esac
+    printf '\n/resume opens chats from the %s account only.\n' "$ACCOUNT" >&2
+    printf 'For chats from the other account, exit and run:\n' >&2
+    printf '  codex-cli --use %s\n' "$other_account" >&2
+    printf 'This keeps the project account unchanged.\n' >&2
+    printf 'To change the project account, run: codex-cli --switch\n\n' >&2
+    printf 'Press Enter to start Codex, or Control-C to cancel: ' >&2
+    if ! IFS= read -r answer; then
+        printf '\n' >&2
+        print_error "Input closed before Codex was started."
+        return 1
+    fi
+}
+
+main() {
+    local read_status=0 one_time_account= script_dir
+
+    script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    if [ -d "$script_dir/codex-switcher-support" ]; then
+        script_dir="$script_dir/codex-switcher-support"
+    fi
+    case "${1-}" in
+        --switcher-version)
+            [ "$#" -eq 1 ] || { print_error "--switcher-version does not accept additional arguments."; return 2; }
+            printf 'codex-switcher %s\n' "$(cat "$script_dir/VERSION")"
+            return 0
+            ;;
+        setup)
+            [ "$#" -eq 1 ] || { print_error "setup does not accept additional arguments."; return 2; }
+            exec /bin/bash "$script_dir/install.sh" --setup-only
+            ;;
+    esac
+
+    if [ "${1-}" = "--use" ]; then
+        case "${2-}" in
+            personal|work) one_time_account=$2; shift 2 ;;
+            *) print_error "Usage: codex-cli --use personal|work [Codex arguments]"; exit 2 ;;
+        esac
+        case "${1-}" in
+            --switch|--account|--global-switch|--use|setup)
+                print_error "--use cannot be combined with account management commands."; exit 2 ;;
+        esac
+    fi
+
+    case "${1-}" in
+        --global-switch)
+            if [ "$#" -ne 1 ]; then
+                print_error "--global-switch does not accept additional arguments."
+                exit 2
+            fi
+            switch_global_account
+            exit 0
+            ;;
+    esac
+
+    if ! command -v git >/dev/null 2>&1; then
+        print_error "git is required but was not found in PATH."
+        exit 1
+    fi
+    if ! command -v codex >/dev/null 2>&1; then
+        print_error "codex is required but was not found in PATH."
+        exit 1
+    fi
+
+    detect_project
+    if [ -z "$one_time_account" ]; then
+        ensure_local_git_exclude
+    fi
+
+    case "${1-}" in
+        --switch)
+            if [ "$#" -ne 1 ]; then
+                print_error "--switch does not accept additional arguments."
+                exit 2
+            fi
+            switch_account
+            exit 0
+            ;;
+        --account)
+            if [ "$#" -ne 1 ]; then
+                print_error "--account does not accept additional arguments."
+                exit 2
+            fi
+            read_status=0
+            read_configured_account || read_status=$?
+            if [ "$read_status" -eq 0 ]; then
+                set_codex_home
+                printf '%s\n' "$(describe_account "$ACCOUNT" "$CODEX_HOME")"
+                exit 0
+            fi
+            if [ "$read_status" -eq 1 ]; then
+                print_error "No Codex account is configured for $PROJECT_ROOT"
+            fi
+            exit 1
+            ;;
+    esac
+
+    if [ -n "$one_time_account" ]; then
+        ACCOUNT=$one_time_account
+    else
+        read_status=0
+        read_configured_account || read_status=$?
+        if [ "$read_status" -ne 0 ]; then
+            if [ "$read_status" -eq 2 ]; then
+                exit 1
+            fi
+            configure_new_project
+        fi
+    fi
+
+    set_codex_home
+    mkdir -p "$CODEX_HOME"
+    . "$script_dir/codex-session-paths.sh"
+    repair_session_paths "$CODEX_HOME" "$LEGACY_HOME"
+    case "${1-}" in
+        login|logout) ;;
+        *) ensure_login ;;
+    esac
+
+    printf 'codex-cli: %s\n' "$(describe_account "$ACCOUNT" "$CODEX_HOME")" >&2
+    show_startup_hint "$@"
+
+    # The shared app-server daemon is per-user, not per-CODEX_HOME, so it would
+    # serve whichever account it started with.
+    exec env CODEX_HOME="$CODEX_HOME" codex --no-daemon "$@"
+}
+
+main "$@"
